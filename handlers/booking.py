@@ -2,11 +2,13 @@
 Запись на диагностику.
 
 Сценарий (FSM): дата (динамические кнопки: 3, 4, 5, 6 дней от текущей) →
-время (строго 08:00, прибытие в 07:00) → подтверждение → сохранение в БД +
-уведомление администратору в Telegram и письмом через EmailJS.
+время (строго 08:00, прибытие в 07:00) → телефон → подтверждение →
+сохранение в БД + уведомление администратору в Telegram и письмом через EmailJS.
 """
 
 from __future__ import annotations
+
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.filters import StateFilter
@@ -37,19 +39,20 @@ from keyboards.inline_kb import (
     time_kb,
 )
 from keyboards.reply_kb import is_cancel
-from services.email_service import notify_admins
-
+from services.notifications import notify_admins
+from aiogram import Bot, F, Router
 router = Router(name="booking")
 
 
 class BookingStates(StatesGroup):
     date = State()
     time = State()
+    phone = State()
     confirm = State()
 
 
 DATE_PROMPT = (
-    "📅 <b>Запись на диагностику — шаг 1 из 2</b>\n\n"
+    "📅 <b>Запись на диагностику — шаг 1 из 3</b>\n\n"
     "Выберите дату. Свободные окна на ближайшие дни:\n"
     f"приём автомобилей строго в {BOOKING_TIME}.\n\n"
     "Если нужной даты нет — напишите в чат, согласуем отдельно."
@@ -59,14 +62,30 @@ DATE_PROMPT = (
 def _time_prompt(date_label: str) -> str:
     return (
         f"📅 Дата: <b>{date_label}</b>\n\n"
-        "🕗 <b>Запись на диагностику — шаг 2 из 2</b>\n\n"
+        "🕗 <b>Запись на диагностику — шаг 2 из 3</b>\n\n"
         f"Время приёма: <b>{BOOKING_TIME}</b>.\n"
         f"⚠️ Приезжайте, пожалуйста, к <b>{ARRIVAL_TIME}</b> — в {BOOKING_TIME} "
         "подъёмник уже занят, и мы рискуем потерять ваше место в очереди."
     )
 
 
-def _confirm_text(brand: str | None, regimen: str | None, date_label: str, time: str) -> str:
+def _phone_prompt(date_label: str, time_value: str) -> str:
+    return (
+        f"📅 Дата: <b>{date_label}</b>\n"
+        f"🕗 Время: <b>{time_value}</b>\n\n"
+        "📞 <b>Шаг 3 из 3 — оставьте номер телефона</b>\n\n"
+        "Напишите номер в чат — мастер-приёмщик позвонит для подтверждения. "
+        "Например: <code>+375 29 123-45-67</code> или <code>80291234567</code>"
+    )
+
+
+def _confirm_text(
+    brand: str | None,
+    regimen: str | None,
+    date_label: str,
+    time: str,
+    phone: str | None = None,
+) -> str:
     lines = [
         "✅ <b>Проверьте запись</b>",
         "",
@@ -82,10 +101,32 @@ def _confirm_text(brand: str | None, regimen: str | None, date_label: str, time:
         f"📅 Дата: <b>{esc(date_label)}</b>",
         f"🕗 Время приёма: <b>{esc(time)}</b>",
         f"⏰ Прибытие: <b>{ARRIVAL_TIME}</b>",
+    ]
+    if phone:
+        lines.append(f"📞 Телефон: <b>{esc(phone)}</b>")
+    lines += [
         "",
         "Нажмите «Подтвердить» — отправим заявку мастеру-приёмщику.",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Валидация телефона
+# ---------------------------------------------------------------------------
+_PHONE_RE = re.compile(r"^[\+\d][\d\s\-\(\)]{7,20}$")
+
+
+def _normalize_phone(raw: str) -> str | None:
+    """Возвращает нормализованный номер или None, если он не похож на телефон."""
+    raw = raw.strip()
+    if not _PHONE_RE.match(raw):
+        return None
+    digits = re.sub(r"\D", "", raw)
+    # 9 цифр — белорусский номер без кода, 15 — предел по стандарту E.164
+    if not (9 <= len(digits) <= 15):
+        return None
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +184,7 @@ async def choose_time_out_of_context(callback: CallbackQuery, state: FSMContext)
 # Шаг 2 — время
 # ---------------------------------------------------------------------------
 @router.callback_query(time_is(), StateFilter(BookingStates.time))
-async def show_confirmation(callback: CallbackQuery, state: FSMContext) -> None:
+async def choose_phone(callback: CallbackQuery, state: FSMContext) -> None:
     time_value = payload_value(callback.data)
     data = await state.get_data()
 
@@ -154,12 +195,9 @@ async def show_confirmation(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.update_data(time=time_value)
-    await state.set_state(BookingStates.confirm)
-    await render(
-        callback,
-        _confirm_text(data.get("brand"), data.get("regimen"), date_label, time_value),
-        confirm_kb(),
-    )
+    await state.set_state(BookingStates.phone)
+    # без клавиатуры — пользователь должен написать номер текстом
+    await render(callback, _phone_prompt(date_label, time_value))
 
 
 @router.callback_query(confirm_is("date"), StateFilter("*"))
@@ -172,7 +210,44 @@ async def back_to_dates(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Шаг 3 — подтверждение
+# Шаг 3 — телефон
+# ---------------------------------------------------------------------------
+@router.message(StateFilter(BookingStates.phone), F.text)
+async def handle_phone(message: Message, state: FSMContext) -> None:
+    if is_cancel(message.text):
+        await state.clear()
+        return await render(message, MENU_TEXT, home_kb())
+
+    phone = _normalize_phone(message.text)
+    if phone is None:
+        data = await state.get_data()
+        return await render(
+            message,
+            "🤔 Похоже, это не номер телефона. Напишите, пожалуйста, в формате "
+            "<code>+375 29 123-45-67</code> или <code>80291234567</code>.\n\n"
+            f"📅 Дата: <b>{esc(data.get('date_label') or '—')}</b>, "
+            f"🕗 время: <b>{esc(data.get('time') or BOOKING_TIME)}</b>",
+        )
+
+    data = await state.get_data()
+    await state.update_data(phone=phone)
+    await state.set_state(BookingStates.confirm)
+
+    await render(
+        message,
+        _confirm_text(
+            data.get("brand"),
+            data.get("regimen"),
+            data.get("date_label", "—"),
+            data.get("time", BOOKING_TIME),
+            phone,
+        ),
+        confirm_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Шаг 4 — подтверждение
 # ---------------------------------------------------------------------------
 @router.callback_query(confirm_is("ok"), StateFilter(BookingStates.confirm))
 async def confirm_booking(
@@ -184,6 +259,7 @@ async def confirm_booking(
     date_label = data.get("date_label")
     date_iso = data.get("date_iso")
     time = data.get("time") or BOOKING_TIME
+    phone = data.get("phone")
 
     if not date_label or not date_iso:
         await state.set_state(BookingStates.date)
@@ -210,6 +286,7 @@ async def confirm_booking(
         date_label=date_label,
         date_iso=date_iso,
         time=time,
+        phone=phone,
     )
 
     await state.clear()
@@ -227,32 +304,20 @@ async def confirm_booking(
 
     # Уведомления: Telegram администраторам + письмо через EmailJS
     await notify_admins(
-        bot=bot,
-        subject=f"Новая запись #{appointment.id}: {date_label} {time}",
-        telegram_text=(
-            "🔔 <b>Новая заявка на диагностику</b>\n\n"
-            f"Заявка: <code>#{appointment.id}</code>\n"
-            f"Дата: <b>{esc(date_label)}</b> ({esc(date_iso)})\n"
-            f"Время: <b>{esc(time)}</b> (прибытие {ARRIVAL_TIME})\n"
-            f"Авто: <b>{esc(data.get('brand') or '—')}</b>\n"
-            f"Цель: <b>{esc(data.get('regimen') or 'диагностика')}</b>\n\n"
-            f"Telegram: @{esc(callback.from_user.username or '—')}\n"
-            f"ID: <code>{callback.from_user.id}</code>\n"
-            f"Имя: {esc(callback.from_user.first_name or '—')}"
-        ),
-        email_lines=[
-            f"Заявка #{appointment.id}",
-            f"Дата: {date_label} ({date_iso})",
-            f"Время приёма: {time}, прибытие: {ARRIVAL_TIME}",
-            f"Автомобиль: {data.get('brand') or '—'}",
-            f"Цель визита: {data.get('regimen') or 'диагностика'}",
-            "",
-            f"Telegram: @{callback.from_user.username or '—'}",
-            f"Telegram ID: {callback.from_user.id}",
-            f"Имя: {callback.from_user.first_name or '—'}",
-        ],
-    )
-
+    bot=bot,
+    telegram_text=(
+        "🔔 <b>Новая заявка на диагностику</b>\n\n"
+        f"Заявка: <code>#{appointment.id}</code>\n"
+        f"📞 Телефон: <b>{esc(phone or '—')}</b>\n"
+        f"Дата: <b>{esc(date_label)}</b> ({esc(date_iso)})\n"
+        f"Время: <b>{esc(time)}</b> (прибытие {ARRIVAL_TIME})\n"
+        f"Авто: <b>{esc(data.get('brand') or '—')}</b>\n"
+        f"Цель: <b>{esc(data.get('regimen') or 'диагностика')}</b>\n\n"
+        f"Telegram: @{esc(callback.from_user.username or '—')}\n"
+        f"ID: <code>{callback.from_user.id}</code>\n"
+        f"Имя: {esc(callback.from_user.first_name or '—')}"
+    ),
+)
 
 @router.callback_query(confirm_is("ok"), StateFilter("*"))
 async def confirm_out_of_context(callback: CallbackQuery, state: FSMContext) -> None:
@@ -264,18 +329,32 @@ async def confirm_out_of_context(callback: CallbackQuery, state: FSMContext) -> 
 # Выход из сценария словами
 # ---------------------------------------------------------------------------
 @router.message(
-    StateFilter(BookingStates.date, BookingStates.time, BookingStates.confirm),
+    StateFilter(
+        BookingStates.date,
+        BookingStates.time,
+        BookingStates.phone,
+        BookingStates.confirm,
+    ),
     F.text,
 )
 async def booking_text_cancel(message: Message, state: FSMContext) -> None:
-    """На шагах выбора даты/времени ждём нажатия кнопок; текстом можно выйти."""
+    """На шагах выбора даты/времени/телефона ждём кнопок или номера; текстом можно выйти."""
     if is_cancel(message.text):
         await state.clear()
         return await render(message, MENU_TEXT, home_kb())
 
-    await render(
-        message,
-        "👆 Дату и время выберите кнопками — так заявка не потеряется.",
-        dates_kb(),
-    )
-    await state.set_state(BookingStates.date)
+    # Пользователь что-то написал не в тему — подсказываем
+    current_state = await state.get_state()
+    if current_state == BookingStates.phone.state:
+        await render(
+            message,
+            "👆 Напишите, пожалуйста, номер телефона текстом, "
+            "или напишите «Отмена», чтобы выйти в главное меню.",
+        )
+    else:
+        await render(
+            message,
+            "👆 Дату и время выберите кнопками — так заявка не потеряется. "
+            "Для выхода напишите «Отмена».",
+            dates_kb(),
+        )

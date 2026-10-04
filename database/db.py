@@ -120,6 +120,7 @@ async def create_appointment(
     date_label: str,
     date_iso: str,
     time: str,
+    phone: str | None = None,
 ) -> Appointment:
     """Создаёт запись на диагностику."""
     async with SessionLocal() as session:
@@ -132,6 +133,7 @@ async def create_appointment(
             date_label=date_label,
             date_iso=date_iso,
             time=time,
+            phone=phone,
         )
         session.add(appointment)
         await session.commit()
@@ -172,3 +174,44 @@ async def get_user_profile(tg_id: int) -> dict:
                 b for b in bookings if b.status in (Appointment.NEW, Appointment.CONFIRMED)
             ],
         }
+
+
+
+async def get_booking_by_id(booking_id: int) -> Appointment | None:
+    """Заявка по ID (для проверки владельца перед отменой)."""
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Appointment).where(Appointment.id == booking_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def cancel_booking(booking_id: int, tg_id: int) -> bool:
+    """
+    Меняет статус заявки на CANCELLED.
+    Возвращает True, если получилось (заявка существует, принадлежит юзеру и активна).
+    """
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Appointment)
+            .where(Appointment.id == booking_id)
+            .where(Appointment.tg_id == tg_id)
+            .where(Appointment.status.in_([Appointment.NEW, Appointment.CONFIRMED]))
+        )
+        booking = result.scalar_one_or_none()
+        if booking is None:
+            return False
+        booking.status = Appointment.CANCELLED
+        await session.commit()
+        return True
+
+async def get_user_active_bookings(tg_id: int) -> list[Appointment]:
+    """Все активные (не отменённые) записи пользователя."""
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Appointment)
+            .where(Appointment.tg_id == tg_id)
+            .where(Appointment.status.in_([Appointment.NEW, Appointment.CONFIRMED]))
+            .order_by(Appointment.date_iso, Appointment.time)
+        )
+        return list(result.scalars().all())

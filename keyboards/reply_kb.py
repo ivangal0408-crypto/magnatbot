@@ -9,7 +9,7 @@ Reply-клавиатуры (обычные кнопки под полем вво
 
 from __future__ import annotations
 
-from aiogram.types import ReplyKeyboardMarkup
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 from keyboards.inline_kb import (
@@ -56,7 +56,7 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
     """Постоянное быстрое меню (показывается на /start)."""
     builder = ReplyKeyboardBuilder()
     for row in _MENU_ROWS:
-        builder.row(*row)
+        builder.row(*(KeyboardButton(text=label) for label in row))
     return builder.as_markup(
         resize_keyboard=True,
         is_persistent=True,

@@ -1,41 +1,48 @@
 """
-Главное меню, /start, правила сервиса и экран «Мой профиль».
-
-Экраны открываются и из inline-меню (callback), и из reply-клавиатуры (текст кнопки).
+Главное меню, /start, правила сервиса, профиль, мои авто, мои записи.
+Все экраны открываются из inline-меню (callback).
 """
 
 from __future__ import annotations
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from config import ADDRESS, BOOKING_TIME, COMPANY_NAME, ARRIVAL_TIME
-from database.db import get_or_create_user, get_user_profile
+from database.db import (
+    cancel_booking,
+    get_booking_by_id,
+    get_or_create_user,
+    get_user_active_bookings,
+    get_user_profile,
+)
 from keyboards.inline_kb import (
     BTN_AI,
     BTN_BOOKING,
     BTN_CALC,
+    BTN_CARS,
     BTN_CONTACTS,
     BTN_PROFILE,
     BTN_RULES,
+    back_kb,
+    booking_cancel_confirm_kb,
     contacts_kb,
     home_kb,
     menu_is,
+    nav_is,
     profile_kb,
     rules_kb,
+    user_bookings_kb,
 )
-from keyboards.reply_kb import main_reply_kb
 from handlers.utils import display_name, esc, render
+from services.notifications import notify_admins
 
 router = Router(name="main_menu")
 
 MENU_TEXT = (
     f"🔧 <b>{COMPANY_NAME}</b> — автосервис в Минске\n\n"
-    f"📍 {ADDRESS}\n"
-    f"🕗 Приём автомобилей — с {BOOKING_TIME} (приезжайте к {ARRIVAL_TIME}, "
-    "если вы с эвакуатора или на прицепе)\n\n"
     "Что я умею:\n"
     "• подсказать вероятную причину неисправности по симптому (ИИ-ассистент);\n"
     "• посчитать стоимость регламентного ТО по марке и пробегу;\n"
@@ -83,7 +90,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     )
     await message.answer(
         f"👋 <b>{display_name(message)}</b>, добро пожаловать!\n\n" + MENU_TEXT,
-        reply_markup=main_reply_kb(),
+        reply_markup=home_kb(),
     )
 
 
@@ -94,80 +101,82 @@ async def cmd_help(message: Message, state: FSMContext) -> None:
     await render(message, RULES_TEXT, rules_kb())
 
 
+@router.message(Command("menu"), StateFilter("*"))
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    """/menu — быстро вернуться в главное меню."""
+    await state.clear()
+    await render(message, MENU_TEXT, home_kb())
+
+
 @router.callback_query(menu_is("home"))
 async def show_home(callback: CallbackQuery, state: FSMContext) -> None:
-    """Кнопка «⬅️ Главное меню» — есть на каждом экране."""
+    """Callback «Главное меню» (старый префикс menu:home)."""
     await state.clear()
     await render(callback, MENU_TEXT, home_kb())
 
 
 # ---------------------------------------------------------------------------
-# Быстрое меню (reply-клавиатура).
-# Все текстовые кнопки обрабатываются здесь, в первом роутере, чтобы нажатие
-# пункта меню всегда работало — в том числе посередине сценария FSM.
+# Навигация: «⬅️ Назад» и «🏠 Главное меню».
 # ---------------------------------------------------------------------------
-@router.message(F.text == BTN_RULES, StateFilter("*"))
-async def menu_rules(message: Message, state: FSMContext) -> None:
+@router.callback_query(nav_is("home"))
+async def nav_home(callback: CallbackQuery, state: FSMContext) -> None:
+    """🏠 Главное меню."""
     await state.clear()
-    await render(message, RULES_TEXT, rules_kb())
+    await render(callback, MENU_TEXT, home_kb())
 
 
-@router.message(F.text == BTN_PROFILE, StateFilter("*"))
-async def menu_profile(message: Message, state: FSMContext) -> None:
+@router.callback_query(nav_is("back"))
+async def nav_back(callback: CallbackQuery, state: FSMContext) -> None:
+    """⬅️ Назад — ведёт в главное меню."""
     await state.clear()
-    await render(message, await build_profile_text(message), profile_kb())
+    await render(callback, MENU_TEXT, home_kb())
 
 
-@router.message(F.text == BTN_CONTACTS, StateFilter("*"))
-async def menu_contacts(message: Message, state: FSMContext) -> None:
-    from handlers.contacts import CONTACTS_TEXT
-
-    await state.clear()
-    await render(message, CONTACTS_TEXT, contacts_kb())
-
-
-@router.message(F.text == BTN_AI, StateFilter("*"))
-async def menu_ai(message: Message, state: FSMContext) -> None:
-    from handlers.ai_assistant import start_assistant
-
-    await start_assistant(message, state)
-
-
-@router.message(F.text == BTN_CALC, StateFilter("*"))
-async def menu_calc(message: Message, state: FSMContext) -> None:
-    from handlers.calculator import start_calculator
-
-    await start_calculator(message, state)
-
-
-@router.message(F.text == BTN_BOOKING, StateFilter("*"))
-async def menu_booking(message: Message, state: FSMContext) -> None:
-    from handlers.booking import start_booking
-
-    await start_booking(message, state)
-
-
-# Пункты меню из inline-клавиатуры (callback)
+# ---------------------------------------------------------------------------
+# Пункты главного меню (callback)
+# ---------------------------------------------------------------------------
 @router.callback_query(menu_is("rules"))
 async def show_rules(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await render(callback, RULES_TEXT, rules_kb())
 
 
-# ---------------------------------------------------------------------------
-# Профиль
-# ---------------------------------------------------------------------------
 @router.callback_query(menu_is("profile"))
 async def show_profile(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await render(callback, await build_profile_text(callback), profile_kb())
 
 
+@router.callback_query(menu_is("cars"))
+async def show_cars(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await render(callback, await build_cars_text(callback), profile_kb())
+
+
+@router.callback_query(menu_is("ai"))
+async def start_ai(callback: CallbackQuery, state: FSMContext) -> None:
+    from handlers.ai_assistant import start_assistant
+
+    await callback.answer()
+    await start_assistant(callback, state)
+
+
+@router.callback_query(menu_is("calc"))
+async def start_calc(callback: CallbackQuery, state: FSMContext) -> None:
+    from handlers.calculator import start_calculator
+
+    await callback.answer()
+    await start_calculator(callback, state)
+
+
+# ---------------------------------------------------------------------------
+# Профиль
+# ---------------------------------------------------------------------------
 async def build_profile_text(event: Message | CallbackQuery) -> str:
     """Собираем текст экрана «Мой профиль» из БД."""
     from_user = event.from_user
     if from_user is None:
-        return "Не удалось определить ваш аккаунт. Нажмите ⬅️ Главное меню."
+        return "Не удалось определить ваш аккаунт. Нажмите 🏠 Главное меню."
 
     profile = await get_user_profile(from_user.id)
     if not profile.get("exists"):
@@ -191,10 +200,8 @@ async def build_profile_text(event: Message | CallbackQuery) -> str:
         for car in cars[:5]:
             price = f", работа ≈ <b>{car.work_price:.0f} BYN</b>" if car.work_price else ""
             regimen = f", {esc(car.regimen)}" if car.regimen else ""
-            lines.append(
-                f"• <b>{esc(car.brand)}</b> — {car.mileage:,} км".replace(",", " ")
-                + f"{regimen}{price}"
-            )
+            mileage_str = f"{car.mileage:,}".replace(",", " ")
+            lines.append(f"• <b>{esc(car.brand)}</b> — {mileage_str} км{regimen}{price}")
     else:
         lines.append("🚗 Автомобилей пока нет — рассчитайте ТО в калькуляторе.")
 
@@ -214,3 +221,125 @@ async def build_profile_text(event: Message | CallbackQuery) -> str:
     lines.append("")
     lines.append("Расчёт ТО ориентировочный: точная стоимость — после диагностики.")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Мои автомобили
+# ---------------------------------------------------------------------------
+async def build_cars_text(event: Message | CallbackQuery) -> str:
+    """Экран «Мои автомобили» — список машин из БД."""
+    from_user = event.from_user
+    if from_user is None:
+        return "Не удалось определить ваш аккаунт. Нажмите 🏠 Главное меню."
+
+    profile = await get_user_profile(from_user.id)
+    cars = profile.get("cars") or []
+
+    lines = ["🚗 <b>Мои автомобили</b>", ""]
+    if not cars:
+        lines.append("Пока пусто. Рассчитайте ТО в калькуляторе — авто сохранится автоматически.")
+    else:
+        for i, car in enumerate(cars, 1):
+            mileage_str = f"{car.mileage:,}".replace(",", " ")
+            regimen = f" · {esc(car.regimen)}" if car.regimen else ""
+            price = f" · работа ≈ <b>{car.work_price:.0f} BYN</b>" if car.work_price else ""
+            lines.append(f"{i}. <b>{esc(car.brand)}</b> — {mileage_str} км{regimen}{price}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Мои записи — список + отмена
+# ---------------------------------------------------------------------------
+@router.callback_query(menu_is("my_bookings"))
+async def show_my_bookings(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    bookings = await get_user_active_bookings(callback.from_user.id)
+
+    if not bookings:
+        text = (
+            "📅 <b>Мои записи</b>\n\n"
+            "Активных записей нет.\n\n"
+            "Чтобы записаться на диагностику — нажмите «📅 Записаться» в главном меню."
+        )
+        await render(callback, text, back_kb())
+        return
+
+    lines = ["📅 <b>Мои записи</b>", ""]
+    for b in bookings:
+        lines.append(
+            f"<b>#{b.id}</b> — {esc(b.date_label)} в {esc(b.time)}\n"
+            f"🚗 {esc(b.brand or '—')} · {esc(b.regimen or 'диагностика')}\n"
+        )
+    lines.append("Чтобы отменить — нажмите кнопку под сообщением.")
+
+    await render(callback, "\n".join(lines), user_bookings_kb(bookings))
+
+
+@router.callback_query(F.data.startswith("bk_cancel:"))
+async def ask_cancel_booking(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    booking_id = int(callback.data.split(":", 1)[1])
+    booking = await get_booking_by_id(booking_id)
+
+    if booking is None or booking.tg_id != callback.from_user.id:
+        await render(callback, "🤔 Заявка не найдена или уже отменена.", back_kb())
+        return
+
+    if booking.status not in ("new", "confirmed"):
+        await render(
+            callback,
+            f"ℹ️ Заявка <b>#{booking.id}</b> уже не активна (статус: {esc(booking.status)}).",
+            back_kb(),
+        )
+        return
+
+    text = (
+        f"⚠️ <b>Отменить заявку #{booking.id}?</b>\n\n"
+        f"📅 {esc(booking.date_label)} в {esc(booking.time)}\n"
+        f"🚗 {esc(booking.brand or '—')}\n\n"
+        "Если планы изменятся — вы всегда сможете записаться снова."
+    )
+    await render(callback, text, booking_cancel_confirm_kb(booking_id))
+
+
+@router.callback_query(F.data.startswith("bk_cancel_ok:"))
+async def do_cancel_booking(
+    callback: CallbackQuery, state: FSMContext, bot: Bot
+) -> None:
+    await state.clear()
+    booking_id = int(callback.data.split(":", 1)[1])
+    booking = await get_booking_by_id(booking_id)
+
+    if booking is None or booking.tg_id != callback.from_user.id:
+        await render(callback, "🤔 Заявка не найдена.", back_kb())
+        return
+
+    ok = await cancel_booking(booking_id, callback.from_user.id)
+    if not ok:
+        await render(
+            callback,
+            "⚠️ Не удалось отменить заявку — возможно, она уже отменена или завершена.",
+            back_kb(),
+        )
+        return
+
+    await notify_admins(
+        bot=bot,
+        telegram_text=(
+            "❌ <b>Клиент отменил заявку</b>\n\n"
+            f"Заявка: <code>#{booking.id}</code>\n"
+            f"Дата: <b>{esc(booking.date_label)}</b> в {esc(booking.time)}\n"
+            f"Авто: {esc(booking.brand or '—')}\n"
+            f"Телефон: {esc(booking.phone or '—')}\n\n"
+            f"Telegram: @{esc(callback.from_user.username or '—')}\n"
+            f"Имя: {esc(callback.from_user.first_name or '—')}"
+        ),
+    )
+
+    await render(
+        callback,
+        f"✅ Заявка <b>#{booking.id}</b> отменена.\n\n"
+        "Мастер-приёмщик получил уведомление. Если захотите записаться снова — "
+        "нажмите «📅 Записаться» в главном меню.",
+        back_kb(),
+    )

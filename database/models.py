@@ -70,9 +70,9 @@ class Appointment(Base):
     )
     tg_id: Mapped[int] = mapped_column(BigInteger, index=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)  # ← новое
     brand: Mapped[str | None] = mapped_column(String(64), nullable=True)
     regimen: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # Дата в человекочитаемом виде «27.08 (чт)» и ISO «2026-10-07» для сортировки
     date_label: Mapped[str] = mapped_column(String(32))
     date_iso: Mapped[str] = mapped_column(String(10), index=True)
     time: Mapped[str] = mapped_column(String(8))
