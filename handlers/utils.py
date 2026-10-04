@@ -2,8 +2,10 @@
 Вспомогательные функции хендлеров.
 
 Главная идея — «чистый чат»: ответы на callback-кнопки редактируют то же
-сообщение (edit_message_text), а ответы на текстовые кнопки reply-клавиатуры
-удаляют сообщение пользователя и выводят новый экран.
+сообщение (edit_message_text), а ответы на текстовые сообщения по умолчанию
+удаляют сообщение пользователя и выводят новый экран. Если нужно сохранить
+сообщение пользователя (например, в ИИ-ассистенте) — передайте
+delete_user_message=False.
 """
 
 from __future__ import annotations
@@ -26,11 +28,18 @@ logger = logging.getLogger(__name__)
 Markup = Union[InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, None]
 
 
-async def render(target: Union[Message, CallbackQuery], text: str, markup: Markup = None) -> None:
+async def render(
+    target: Union[Message, CallbackQuery],
+    text: str,
+    markup: Markup = None,
+    *,
+    delete_user_message: bool = True,
+) -> None:
     """
     Показать экран:
     * callback — редактируем сообщение бота (без спама);
-    * message (нажатие reply-кнопки) — удаляем сообщение юзера и шлём новое.
+    * message — по умолчанию удаляем сообщение юзера и шлём новое.
+      Если delete_user_message=False — сообщение юзера остаётся в чате.
     """
     if isinstance(target, CallbackQuery):
         message = target.message
@@ -51,11 +60,13 @@ async def render(target: Union[Message, CallbackQuery], text: str, markup: Marku
         await target.answer()
         return
 
-    try:
-        await target.delete()
-    except TelegramAPIError:
-        # удалить сообщение пользователя нельзя (не приватный чат) — не страшно
-        pass
+    if delete_user_message:
+        try:
+            await target.delete()
+        except TelegramAPIError:
+            # удалить сообщение пользователя нельзя (не приватный чат) — не страшно
+            pass
+
     await target.answer(text, reply_markup=markup)
 
 

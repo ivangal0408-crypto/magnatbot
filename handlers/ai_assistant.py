@@ -1,15 +1,13 @@
 """
 ИИ-ассистент (RAG): пользователь описывает симптом своими словами,
 бот подбирает блоки из data/knowledge_base.txt и спрашивает у VedAI
-вероятную причину и рекомендацию. Ответ редактируется в одном сообщении.
-
-Также здесь лежит «последний» обработчик текста: если update не подошёл
-ни одному роутеру, подсказываем меню.
+вероятную причину и рекомендацию.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -20,7 +18,7 @@ from aiogram.types import CallbackQuery, Message
 
 from config import COMPANY_NAME
 from handlers.main_menu import MENU_TEXT
-from handlers.utils import esc, render
+from handlers.utils import render
 from keyboards.inline_kb import ai_answer_kb, back_kb, home_kb, menu_is
 from keyboards.reply_kb import is_cancel
 from services.rag_service import answer_question
@@ -29,7 +27,6 @@ router = Router(name="ai_assistant")
 logger = logging.getLogger(__name__)
 
 MAX_QUESTION_LENGTH = 600
-# Лимит текста сообщения в Telegram — 4096 символов, берём с запасом
 MAX_MESSAGE_LENGTH = 3900
 
 INTRO_TEXT = (
@@ -46,6 +43,9 @@ INTRO_TEXT = (
 )
 
 THINKING_TEXT = "⏳ Смотрю по базе типовых обращений сервиса…"
+
+# Какие HTML-теги разрешены в ответе ИИ (Telegram поддерживает именно эти)
+_ALLOWED_TAGS = re.compile(r"</?(b|strong|i|em|u|s|code|pre|a)(\s[^>]*)?>", re.IGNORECASE)
 
 
 class AiStates(StatesGroup):
@@ -81,24 +81,18 @@ async def process_question(message: Message, state: FSMContext) -> None:
 
     question = question[:MAX_QUESTION_LENGTH]
 
-    # «Читаем» ответ в том же сообщении, чтобы не спамить
+    # Показываем «печатаю…», не удаляя сообщение пользователя
     await state.clear()
-    try:
-        await message.delete()
-    except TelegramAPIError:
-        pass  # сообщение пользователя мог удалиться или чат не приватный
     thinking = await message.answer(THINKING_TEXT)
 
     answer, source, _titles = await answer_question(question)
 
-    # Ответ нейросети — обычный текст: экранируем, чтобы HTML-разметка не сломала отправку.
-    # Формированный нами ответ по базе знаний уже содержит теги — его не трогаем.
-    if source == "vedai":
-        text = esc(answer)
-    else:
-        text = answer + "\n\n<i>Ответ собран по базе типовых обращений сервиса.</i>"
+    # Заменяем «thinking» на нормальный ответ
+    text = _clean_ai_answer(answer)
 
-    # Лимит сообщения Telegram — 4096 символов
+    if source == "knowledge_base":
+        text += "\n\n<i>Ответ собран по базе типовых обращений сервиса.</i>"
+
     if len(text) > MAX_MESSAGE_LENGTH:
         text = text[: MAX_MESSAGE_LENGTH - 20].rstrip() + "\n…(продолжение уточните у мастера)"
 
@@ -106,7 +100,40 @@ async def process_question(message: Message, state: FSMContext) -> None:
         await thinking.edit_text(text, reply_markup=ai_answer_kb())
     except TelegramAPIError:
         logger.exception("Не удалось отредактировать ответ ассистента, отправляем новый")
-        await render(message, text, ai_answer_kb())
+        await message.answer(text, reply_markup=ai_answer_kb())
+
+
+def _clean_ai_answer(text: str) -> str:
+    """
+    Убираем markdown-обёртки (**текст**, ## заголовки), которые модель иногда всё же
+    добавляет, и оставляем только безопасные HTML-теги для Telegram.
+    """
+    # **жирный** → <b>жирный</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # *курсив* → <i>курсив</i>
+    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
+    # ## заголовки → жирная строка
+    text = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    # ```код``` → <code>код</code>
+    text = re.sub(r"```(.+?)```", r"<code>\1</code>", text, flags=re.DOTALL)
+    # `код` → <code>код</code>
+    text = re.sub(r"`([^`\n]+?)`", r"<code>\1</code>", text)
+    # Экранируем амперсанды/угловые скобки, которые не являются нашими тегами
+    # (осторожный шаг — модель обычно их не использует, но подстрахуемся)
+    text = _escape_unknown_tags(text)
+    return text.strip()
+
+
+def _escape_unknown_tags(text: str) -> str:
+    """Оставляет только разрешённые HTML-теги, остальные <...> экранирует."""
+    def _repl(match: re.Match) -> str:
+        tag = match.group(0)
+        if _ALLOWED_TAGS.match(tag):
+            return tag
+        # Экранируем только угловые скобки, не трогая содержимое
+        return tag.replace("<", "&lt;").replace(">", "&gt;")
+
+    return re.sub(r"<[^>]+>", _repl, text)
 
 
 @router.message(StateFilter(AiStates.question), ~F.text)
@@ -121,7 +148,6 @@ async def process_not_text(message: Message, state: FSMContext) -> None:
 
 # ---------------------------------------------------------------------------
 # Финальный обработчик: текст, который не распознал ни один роутер
-# (этот роутер подключён последним, поэтому не мешает FSM-сценариям)
 # ---------------------------------------------------------------------------
 @router.message(F.text, StateFilter(None))
 async def unknown_text(message: Message, state: FSMContext) -> None:
